@@ -3,7 +3,7 @@ app = Flask(__name__)
 
 from sqlalchemy import create_engine, asc
 from sqlalchemy.orm import sessionmaker
-from database_setup import Base, Restaurant, MenuItem
+from database_setup import Base, Restaurant, MenuItem, User
 
 #Google hybrid auth
 from flask import session as login_session
@@ -63,6 +63,7 @@ def gconnect():
     response.headers['Content-Type'] = 'application/json'
 
   # Store the access token in session for later use
+  login_session['provider'] = 'google'
   login_session['credentials'] = credentials
   login_session['gplus_id'] = gplus_id
 
@@ -75,6 +76,12 @@ def gconnect():
   login_session['username'] = data["name"]
   login_session['picture'] = data["picture"]
   login_session['email'] = data["email"]
+
+  # Log in the user
+  uid = getUserId(login_session['email'])
+  if not uid:
+    uid = createUser(login_session)
+  login_session['user_id'] = uid
 
   output = ''
   output+= '<h1>Welcome, '
@@ -100,13 +107,6 @@ def gdisconnect():
   h = httplib2.Http()
   result = h.request(url, 'GET')[0]
   if result['status'] == '200':
-    # Reset the user's session.
-    del login_session['credentials']
-    del login_session['gplus_id']
-    del login_session['username']
-    del login_session['email']
-    del login_session['picture']
-
     response = make_response(json.dumps('Successfully disconnected.'), 200)
     response.headers['Content-Type'] = 'application/json'
     return response
@@ -116,6 +116,112 @@ def gdisconnect():
     response.headers['Content-Type'] = 'application/json'
     return response
 
+# Adding new users
+def createUser(login_session):
+  newUser = User(name=login_session['username'], email=login_session['email'],
+    picture=login_session['picture'])
+  session.add(newUser)
+  session.commit()
+  user = session.query(User).filter_by(email=login_session['email']).one()
+  return user.id
+
+def getUserInfo(user_id):
+  user = session.query(User).filter_by(id = user_id).one()
+  return user
+
+def getUserId(email):
+  try:
+    user = session.query(User).filter_by(email = email).one()
+    return user.id
+  except:
+    return None
+
+# Facebook
+@app.route('/fbconnect', methods=["POST"])
+def fbconnect():
+  if request.args.get('state') != login_session['state']:
+    response = make_response(json.dumps('Invalid state parameter'), 401)
+    response.headers['Content-Type'] = 'application/json'
+    return response
+  access_token = request.data
+  # Exchange client token for long lived server side token with GET/ oauth/access_token?grant_type=fb_exchange_token&client_id={app-id}&client_secret={client-secret}&fb_exchange_token={short-lived-token}
+  app_id = json.loads(open('fb_client_secrets.json', 'r').read())['web']['app_id']
+  app_secret = json.loads(open('fb_client_secrets.json', 'r').read())['web']['app_secret']
+  url = 'https://graph.facebook.com/oauth/access_token?grant_type=fb_exchange_token&client_id=%s&client_secret=%s&fb_exchange_token=%s' %(app_id, app_secret, access_token)
+  h = httplib2.Http()
+  result = h.request(url, 'GET')[1]
+
+  # use token to get user info from api
+  userinfo_url = "https://graph.facebook.com/oauth2/me"
+  # strip expire tag from token
+  token = result.split("&")[0]
+
+  url = "https://graph.facebook.com/v2.2/me?%s" % token
+  h = httplib2.Http()
+  result = h.request(url, 'GET')[1]
+
+  print "url sent for api access: %s" % url
+  print "API json result: %s" % result
+  data = json.loads(result)
+  login_session['provider'] = 'facebook'
+  login_session['username'] = data['name']
+  login_session['email'] = data['email']
+  login_session['facebook_id'] = data['id']
+
+  # Get user picture (Facebook uses separate API call to retrieve pictures)
+  url = "https://graph.facebook.com/v2.2/me/picture?%s&redirect=0&height=200&width=200" % token
+  h = httplib2.Http()
+  result = h.request(url, 'GET')[1]
+  data = json.loads(result)
+  login_session['picture'] = data['data']['url']
+
+  # See if user exists
+  user_id = getUserId(login_session['email'])
+  if not user_id:
+    user_id = createUser(login_session)
+  login_session['user_id'] = user_id
+
+  output = ''
+  output+= '<h1>Welcome, '
+  output+= login_session['username']
+  output+= '!<\h1>'
+  output+= '<img src ="'
+  output+= login_session['picture']
+  output+= '" style = "width: 300px; height:300px;border-radius:150px; -webkit-border-radius: 150px; -moz-border-radius: 150px;">'
+  flash("You are now logged in as %s" %login_session['username'])
+  return output
+
+@app.route('/fbdisconnect')
+def fbdisconnect():
+  facebook_id = login_session['facebook_id']
+  access_token = login_session['access_token']
+  url = 'https://graph.facebook.com/%s/permissions?access_token=%s' %(facebook_id,access_token)
+  h = httplib2.Http()
+  result = h.request(url, 'DELETE')[1]
+  return 'You have been logged out'
+
+@app.route('/disconnect')
+def disconnect():
+  if 'provider' in login_session:
+    if login_session['provider'] == 'google':
+      gdisconnect()
+      del login_session['gplus_id']
+      del login_session['credentials']
+    if login_session['provider'] == 'facebook':
+      fbdisconnect()
+      del login_session['facebook_id']
+
+    del login_session['username']
+    del login_session['email']
+    del login_session['picture']
+    del login_session['user_id']
+    del login_session['facebook_id']
+    flash('You have been logged out')
+    return redirect(url_for('showRestaurants'))
+  else:
+    flash('You were not logged in to begin with')
+    return redirect(url_for('showRestaurants'))
+
 @app.route("/login")
 def showLogin():
   state = ''.join(random.choice(string.ascii_uppercase + string.digits) for x in xrange(32))
@@ -124,7 +230,7 @@ def showLogin():
   return render_template('login.html', STATE=state)
 
 #Connect to Database and create database session
-engine = create_engine('sqlite:///restaurantmenu.db')
+engine = create_engine('sqlite:///restaurantmenuwithusers.db')
 Base.metadata.bind = engine
 
 DBSession = sessionmaker(bind=engine)
@@ -155,7 +261,10 @@ def restaurantsJSON():
 @app.route('/restaurant/')
 def showRestaurants():
   restaurants = session.query(Restaurant).order_by(asc(Restaurant.name))
-  return render_template('restaurants.html', restaurants = restaurants)
+  if 'username' in login_session:
+    return render_template('restaurants.html', restaurants = restaurants)
+  else:
+    return render_template('publicrestaurants.html', restaurants = restaurants)
 
 #Create a new restaurant
 @app.route('/restaurant/new/', methods=['GET','POST'])
@@ -163,7 +272,7 @@ def newRestaurant():
   if 'username' not in login_session:
     return redirect('/login')
   if request.method == 'POST':
-      newRestaurant = Restaurant(name = request.form['name'])
+      newRestaurant = Restaurant(name = request.form['name'], user_id=login_session['user_id'])
       session.add(newRestaurant)
       flash('New Restaurant %s Successfully Created' % newRestaurant.name)
       session.commit()
@@ -206,7 +315,13 @@ def deleteRestaurant(restaurant_id):
 def showMenu(restaurant_id):
     restaurant = session.query(Restaurant).filter_by(id = restaurant_id).one()
     items = session.query(MenuItem).filter_by(restaurant_id = restaurant_id).all()
-    return render_template('menu.html', items = items, restaurant = restaurant)
+    creator = getUserInfo(restaurant.user_id)
+    if 'username' not in login_session or creator.id != login_session['user_id']:
+      return render_template('publicmenu.html', items = items, restaurant = restaurant,
+        creator = creator)
+    else:
+      return render_template('menu.html', items = items, restaurant = restaurant,
+        creator = creator)
 
 
 
@@ -217,7 +332,7 @@ def newMenuItem(restaurant_id):
     return redirect('/login')
   restaurant = session.query(Restaurant).filter_by(id = restaurant_id).one()
   if request.method == 'POST':
-      newItem = MenuItem(name = request.form['name'], description = request.form['description'], price = request.form['price'], course = request.form['course'], restaurant_id = restaurant_id)
+      newItem = MenuItem(name = request.form['name'], description = request.form['description'], price = request.form['price'], course = request.form['course'], restaurant_id = restaurant_id, user_id = login_session['user_id'])
       session.add(newItem)
       session.commit()
       flash('New Menu %s Item Successfully Created' % (newItem.name))
